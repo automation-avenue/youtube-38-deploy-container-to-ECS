@@ -1,0 +1,129 @@
+*******************************************************************************************************************************************************************
+
+Networking:
+
+aws ec2 create-vpc --cidr-block 10.0.0.0/16
+VPC_ID="<replace_with_id_generated>"
+echo $VPC_ID
+aws ec2 create-tags --resources $VPC_ID --tags Key=Name,Value=Mareks_VPC
+aws ec2 create-subnet --vpc-id $VPC_ID --availability-zone eu-west-2a --cidr-block 10.0.1.0/24
+SUBNET1_ID="<replace_with_id_generated>"
+aws ec2 create-subnet --vpc-id $VPC_ID --availability-zone eu-west-2b --cidr-block 10.0.2.0/24
+SUBNET2_ID="<replace_with_id_generated>"
+aws ec2 create-internet-gateway
+IGW_ID="<replace_with_id_generated>"
+aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
+RTB_ID="<replace_with_id_generated>"
+aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+aws ec2 create-security-group --group-name ecs_sg --description "Security group for ECS tasks" --vpc-id $VPC_ID
+SG_ID="<replace_with_id_generated>"
+aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 5100 --cidr 0.0.0.0/0
+
+*******************************************************************************************************************************************************************
+
+ALB:
+aws elbv2 create-load-balancer --name rembg-alb --subnets $SUBNET1_ID $SUBNET2_ID --security-groups $SG_ID --scheme internet-facing --type application
+ALB_ID="<replace_with_id_generated>"
+
+aws elbv2 create-target-group --name rembg-target-group --protocol HTTP --port 5100 --vpc-id $VPC_ID --target-type ip
+TG_ID="<replace_with_id_generated>"
+
+aws elbv2 create-listener --load-balancer-arn $ALB_ID --protocol HTTP --port 5100 --default-actions Type=forward,TargetGroupArn=$TG_ID
+
+
+*******************************************************************************************************************************************************************
+
+Docker:
+  
+# go to https://github.com/codediodeio/rembg-webapp-tutorial website and click 'code - download zip'
+cd Downloads
+unzip rembg-webapp-tutorial-main.zip
+cd rembg-webapp-tutorial-main/
+cat Dockerfile
+wget https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx
+
+sudo docker build -t rembg-app .
+  
+aws ecr create-repository --repository-name rembg-app
+ACC_ID="<your Amazon account id>"
+sudo docker tag rembg-app $ACC_ID.dkr.ecr.eu-west-2.amazonaws.com/rembg-app
+aws ecr get-login-password --region eu-west-2 | sudo docker login --username AWS --password-stdin $ACC_ID.dkr.ecr.eu-west-2.amazonaws.com
+sudo docker push $ACC_ID.dkr.ecr.eu-west-2.amazonaws.com/rembg-app
+
+cd ..
+vim cat ecs-trust-policy.json
+
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+}
+
+
+aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file://ecs-trust-policy.json
+aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+aws ecs create-cluster --cluster-name rembg-cluster
+aws logs create-log-group --log-group-name /ecs/rembg-app
+
+vim rembg-task-definition.json 
+  
+{
+    "family": "rembg-app-task",
+    "networkMode": "awsvpc",
+    "containerDefinitions": [
+        {
+            "name": "rembg-app-container",
+            "image": "${ACC_ID}.dkr.ecr.eu-west-2.amazonaws.com/rembg-app",
+            "memory": 2048,
+            "cpu": 1024,
+            "essential": true,
+            "portMappings": [
+                {
+                    "containerPort": 5100,
+                    "hostPort": 5100,
+                    "protocol": "tcp"
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/rembg-app",
+                    "awslogs-region": "eu-west-2",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        }
+    ],
+    "requiresCompatibilities": ["FARGATE"],
+    "executionRoleArn": "arn:aws:iam::${ACC_ID}:role/ecsTaskExecutionRole",
+    "taskRoleArn": "arn:aws:iam::${ACC_ID}:role/ecsTaskExecutionRole",
+    "cpu": "1024",
+    "memory": "2048"
+}
+
+export ACC_ID="<your Amazon account id>"
+envsubst < rembg-task-definition.json > rembg-task-definition-new.json
+cat rembg-task-definition-new.json
+
+aws ecs register-task-definition --cli-input-json file://rembg-task-definition-new.json
+
+aws ecs create-service \
+    --cluster rembg-cluster \
+    --service-name rembg-service \
+    --task-definition rembg-app-task \
+    --load-balancers targetGroupArn=$TG_ID,containerName=rembg-app-container,containerPort=5100 \
+    --desired-count 1 \
+    --launch-type "FARGATE" \
+    --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1_ID,$SUBNET2_ID],securityGroups=[$SG_ID],assignPublicIp=ENABLED}"
+
+Now you can run the service on :
+http://<load_balancer_DNS>:5100/
+
